@@ -142,7 +142,7 @@ class MockCabAPI:
             
             # Calculate distance using OSRM (falls back to Haversine if API fails)
             distance = self.calculate_distance_osrm(pickup_coords, dropoff_coords)
-            
+            #print(f"\nDistance between {pickup} and {dropoff}: {distance}\n")
             return distance
             
         except Exception as e:
@@ -298,6 +298,8 @@ class VoiceCabApp:
         self.current_dropoff = ""
         self.current_prices = {}
         self.is_listening = False
+        self.awaiting_booking_confirmation = False
+        self.recommended_platform = ""
         
     def setup_gemini(self):
         """Setup Gemini API"""
@@ -331,13 +333,6 @@ class VoiceCabApp:
             # Test the API key with a simple call
             model = genai.GenerativeModel('gemini-2.0-flash-exp')
             test_response = model.generate_content("Hello")
-            
-            # Create LangChain wrapper with correct model specification for CrewAI
-            #self.llm = ChatGoogleGenerativeAI(
-            #    model="gemini-2.0-flash-exp",  # Use the model name without prefix
-            #    google_api_key=api_key,
-            #    temperature=0.3
-            #)
             
             self.llm=LLM(
                 api_key=os.getenv("GEMINI_API_KEY"),
@@ -626,6 +621,25 @@ class VoiceCabApp:
             self.log_message(f"LLM extraction failed: {e}")
             return self.location_extractor.extract_locations(text)
     
+    def check_yes_no_response(self, text: str) -> str:
+        """Check if the user response is yes or no"""
+        text_lower = text.lower().strip()
+        
+        # Positive responses
+        positive_words = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'fine', 'book', 'proceed', 'go ahead', 'confirm']
+        # Negative responses
+        negative_words = ['no', 'nope', 'not', "don't", 'cancel', 'stop', 'wait']
+        
+        for word in positive_words:
+            if word in text_lower:
+                return 'yes'
+        
+        for word in negative_words:
+            if word in text_lower:
+                return 'no'
+        
+        return 'unclear'
+    
     def get_prices_direct(self, pickup: str, dropoff: str):
         """Get prices directly from mock API"""
         try:
@@ -642,7 +656,6 @@ class VoiceCabApp:
     
     def get_prices(self, pickup: str, dropoff: str):
         """Get prices using the price retrieval agent or direct API"""
-        
         # Always use direct API to avoid LiteLLM issues
         return self.get_prices_direct(pickup, dropoff)
     
@@ -686,12 +699,54 @@ class VoiceCabApp:
         # Disable booking buttons after successful booking
         self.book_uber_button.config(state='disabled')
         self.book_ola_button.config(state='disabled')
+        
+        # Close the application after successful booking
+        self.log_message("Application will close in 3 seconds...")
+        self.root.after(3000, self.root.quit)
+    
+    def reset_for_new_search(self):
+        """Reset the application state for a new location search"""
+        self.current_pickup = ""
+        self.current_dropoff = ""
+        self.current_prices = {}
+        self.awaiting_booking_confirmation = False
+        self.recommended_platform = ""
+        
+        # Clear manual input fields
+        self.pickup_entry.delete(0, tk.END)
+        self.dropoff_entry.delete(0, tk.END)
+        
+        # Disable booking buttons
+        self.book_uber_button.config(state='disabled')
+        self.book_ola_button.config(state='disabled')
+        
+        self.log_message("Ready for new location search...")
+        self.speak("Please provide your pickup and dropoff locations again.")
     
     def process_voice_input(self):
         """Process voice input through the agent pipeline"""
         text = self.listen_for_speech()
         if not text:
             return
+        
+        # Check if we're waiting for booking confirmation
+        if self.awaiting_booking_confirmation:
+            response = self.check_yes_no_response(text)
+            
+            if response == 'yes':
+                self.log_message(f"User confirmed booking {self.recommended_platform}")
+                self.awaiting_booking_confirmation = False
+                self.book_cab(self.recommended_platform)
+                return
+            elif response == 'no':
+                self.log_message("User declined booking, asking for new locations")
+                self.awaiting_booking_confirmation = False
+                self.reset_for_new_search()
+                return
+            else:
+                self.log_message("Could not understand response. Please say 'yes' to book or 'no' to search again.")
+                self.speak("I didn't understand. Please say 'yes' to book or 'no' to search for new locations.")
+                return
         
         # Extract locations using LLM or fallback
         locations = self.extract_locations_with_llm(text)
@@ -728,16 +783,19 @@ class VoiceCabApp:
         comparison = self.compare_prices(prices)
         self.log_message(f"Price Comparison: {comparison}")
         
-        # Speak the results
-        speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees."
+        # Determine recommended platform and set up for booking confirmation
         if ola_price < uber_price:
-            speech_text += f" Ola is cheaper by {round(uber_price - ola_price)} rupees. Would you like to book Ola?"
+            self.recommended_platform = 'ola'
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Ola is cheaper by {round(uber_price - ola_price)} rupees. Would you like to book Ola?"
         elif uber_price < ola_price:
-            speech_text += f" Uber is cheaper by {round(ola_price - uber_price)} rupees. Would you like to book Uber?"
+            self.recommended_platform = 'uber'
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Uber is cheaper by {round(ola_price - uber_price)} rupees. Would you like to book Uber?"
         else:
-            speech_text += " Both platforms have the same price."
+            self.recommended_platform = 'uber'  # Default to uber if same price
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Both platforms have the same price. Would you like to book Uber?"
         
         self.speak(speech_text)
+        self.awaiting_booking_confirmation = True
         
         # Enable booking buttons
         self.book_uber_button.config(state='normal')
@@ -815,9 +873,8 @@ def main():
     app.log_message("Welcome to Voice-Enabled Cab Price Comparison!")
     app.log_message("You can use voice input or manual input to compare prices.")
     app.log_message("For voice input, click 'Start Voice Input' and say something like:")
-    app.log_message("- 'Book a cab from airport to mall'")
-    app.log_message("- 'I want to go from home to office'")
-    app.log_message("- 'Pick me up at station and drop me at hospital'")
+    app.log_message("- 'Book a cab from BMS College to BTM Layout'")
+    app.log_message("- 'I want to go from Jayanagara 4th Block to Commercial Street, Bangalore'")
     app.log_message("")
     app.log_message("For manual input, simply fill in the pickup and dropoff locations.")
     app.log_message("")
