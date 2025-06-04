@@ -14,9 +14,10 @@ from typing import Dict, List, Optional
 import json
 import re
 import os
+import requests
 
 class MockCabAPI:
-    """Mock API for simulating Uber and Ola cab services"""
+    """Mock API for simulating Uber and Ola cab services with real-time distance calculation"""
     
     def __init__(self):
         self.base_prices = {
@@ -24,19 +25,130 @@ class MockCabAPI:
             'ola': {'base': 45, 'per_km': 10, 'surge_multiplier': 1.0}
         }
         self.bookings = []
+        
+        # OpenStreetMap services
+        self.nominatim_url = "https://nominatim.openstreetmap.org/search"
+        self.osrm_url = "http://router.project-osrm.org/route/v1/driving"
+        
+        # Cache for geocoded locations to avoid repeated API calls
+        self.location_cache = {}
+    
+    def geocode_location(self, location: str) -> Dict:
+        """Convert location string to latitude and longitude using Nominatim (OpenStreetMap)"""
+        if location in self.location_cache:
+            return self.location_cache[location]
+        
+        try:
+            params = {
+                'q': location,
+                'format': 'json',
+                'limit': 1,
+                'addressdetails': 1
+            }
+            
+            headers = {
+                'User-Agent': 'MockCabAPI/1.0 (your-email@example.com)'  # Required by Nominatim
+            }
+            
+            response = requests.get(self.nominatim_url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data:
+                result = {
+                    'lat': float(data[0]['lat']),
+                    'lon': float(data[0]['lon']),
+                    'display_name': data[0]['display_name']
+                }
+                self.location_cache[location] = result
+                return result
+            else:
+                # Return None if location not found
+                return None
+                
+        except Exception as e:
+            print(f"Geocoding failed for {location}: {e}")
+            return None
+
+    
+    def calculate_distance_osrm(self, pickup_coords: Dict, dropoff_coords: Dict) -> float:
+        """Calculate distance using OSRM (Open Source Routing Machine) - OpenStreetMap based"""
+        try:
+            # Format coordinates for OSRM API
+            pickup_coord = f"{pickup_coords['lon']},{pickup_coords['lat']}"
+            dropoff_coord = f"{dropoff_coords['lon']},{dropoff_coords['lat']}"
+            
+            url = f"{self.osrm_url}/{pickup_coord};{dropoff_coord}"
+            params = {
+                'overview': 'false',  # We don't need the route geometry
+                'steps': 'false'      # We don't need turn-by-turn directions
+            }
+            
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data.get('code') == 'Ok' and 'routes' in data and data['routes']:
+                # Distance is returned in meters, convert to kilometers
+                distance_km = data['routes'][0]['distance'] / 1000
+                return round(distance_km, 2)
+            else:
+                raise Exception(f"OSRM API error: {data.get('message', 'No route found')}")
+                
+        except Exception as e:
+            print(f"OSRM API failed: {e}")
+            return self._calculate_haversine_distance(pickup_coords, dropoff_coords)
+    
+    def _calculate_haversine_distance(self, coord1: Dict, coord2: Dict) -> float:
+        """Fallback distance calculation using Haversine formula"""
+        import math
+        
+        lat1, lon1 = math.radians(coord1['lat']), math.radians(coord1['lon'])
+        lat2, lon2 = math.radians(coord2['lat']), math.radians(coord2['lon'])
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        
+        # Earth's radius in kilometers
+        r = 6371
+        distance = r * c
+        
+        # Add some randomness to simulate real road distances vs straight-line distance
+        road_factor = random.uniform(1.2, 1.5)  # Roads are typically 20-50% longer than straight line
+        
+        return round(distance * road_factor, 2)
     
     def calculate_distance(self, pickup: str, dropoff: str) -> float:
-        """Simulate distance calculation between locations"""
-        # Mock distance calculation based on location names
-        locations = ['airport', 'mall', 'station', 'hospital', 'office', 'home']
-        pickup_clean = pickup.lower().strip()
-        dropoff_clean = dropoff.lower().strip()
-        
-        # Simple mock distance based on string similarity
-        base_distance = random.uniform(5, 25)
-        if any(loc in pickup_clean for loc in locations) and any(loc in dropoff_clean for loc in locations):
-            return round(base_distance, 2)
-        return round(base_distance + random.uniform(0, 10), 2)
+        """Calculate real distance between locations using OpenStreetMap services"""
+        try:
+            # Add small delay to respect API rate limits
+            time.sleep(0.1)
+            
+            # Geocode both locations
+            pickup_coords = self.geocode_location(pickup)
+            dropoff_coords = self.geocode_location(dropoff)
+            
+            # Check if geocoding was successful
+            if not pickup_coords:
+                raise Exception(f"Could not find location: {pickup}")
+            if not dropoff_coords:
+                raise Exception(f"Could not find location: {dropoff}")
+            
+            print(f"Pickup: {pickup} -> {pickup_coords['display_name']}")
+            print(f"Dropoff: {dropoff} -> {dropoff_coords['display_name']}")
+            
+            # Calculate distance using OSRM (falls back to Haversine if API fails)
+            distance = self.calculate_distance_osrm(pickup_coords, dropoff_coords)
+            #print(f"\nDistance between {pickup} and {dropoff}: {distance}\n")
+            return distance
+            
+        except Exception as e:
+            print(f"Distance calculation failed: {e}")
+            # Ultimate fallback to haversine calculation with random coordinates
+            return round(random.uniform(5, 30), 2)
     
     def get_price(self, platform: str, pickup: str, dropoff: str) -> Dict:
         """Get price estimate for a platform"""
@@ -75,7 +187,7 @@ class MockCabAPI:
         }
         self.bookings.append(booking)
         return booking
-
+    
 # Global instance of MockCabAPI to share across tools
 mock_cab_api = MockCabAPI()
 
@@ -186,6 +298,8 @@ class VoiceCabApp:
         self.current_dropoff = ""
         self.current_prices = {}
         self.is_listening = False
+        self.awaiting_booking_confirmation = False
+        self.recommended_platform = ""
         
     def setup_gemini(self):
         """Setup Gemini API"""
@@ -219,13 +333,6 @@ class VoiceCabApp:
             # Test the API key with a simple call
             model = genai.GenerativeModel('gemini-2.0-flash-exp')
             test_response = model.generate_content("Hello")
-            
-            # Create LangChain wrapper with correct model specification for CrewAI
-            #self.llm = ChatGoogleGenerativeAI(
-            #    model="gemini-2.0-flash-exp",  # Use the model name without prefix
-            #    google_api_key=api_key,
-            #    temperature=0.3
-            #)
             
             self.llm=LLM(
                 api_key=os.getenv("GEMINI_API_KEY"),
@@ -514,6 +621,25 @@ class VoiceCabApp:
             self.log_message(f"LLM extraction failed: {e}")
             return self.location_extractor.extract_locations(text)
     
+    def check_yes_no_response(self, text: str) -> str:
+        """Check if the user response is yes or no"""
+        text_lower = text.lower().strip()
+        
+        # Positive responses
+        positive_words = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'fine', 'book', 'proceed', 'go ahead', 'confirm']
+        # Negative responses
+        negative_words = ['no', 'nope', 'not', "don't", 'cancel', 'stop', 'wait']
+        
+        for word in positive_words:
+            if word in text_lower:
+                return 'yes'
+        
+        for word in negative_words:
+            if word in text_lower:
+                return 'no'
+        
+        return 'unclear'
+    
     def get_prices_direct(self, pickup: str, dropoff: str):
         """Get prices directly from mock API"""
         try:
@@ -530,7 +656,6 @@ class VoiceCabApp:
     
     def get_prices(self, pickup: str, dropoff: str):
         """Get prices using the price retrieval agent or direct API"""
-        
         # Always use direct API to avoid LiteLLM issues
         return self.get_prices_direct(pickup, dropoff)
     
@@ -574,12 +699,54 @@ class VoiceCabApp:
         # Disable booking buttons after successful booking
         self.book_uber_button.config(state='disabled')
         self.book_ola_button.config(state='disabled')
+        
+        # Close the application after successful booking
+        self.log_message("Application will close in 3 seconds...")
+        self.root.after(3000, self.root.quit)
+    
+    def reset_for_new_search(self):
+        """Reset the application state for a new location search"""
+        self.current_pickup = ""
+        self.current_dropoff = ""
+        self.current_prices = {}
+        self.awaiting_booking_confirmation = False
+        self.recommended_platform = ""
+        
+        # Clear manual input fields
+        self.pickup_entry.delete(0, tk.END)
+        self.dropoff_entry.delete(0, tk.END)
+        
+        # Disable booking buttons
+        self.book_uber_button.config(state='disabled')
+        self.book_ola_button.config(state='disabled')
+        
+        self.log_message("Ready for new location search...")
+        self.speak("Please provide your pickup and dropoff locations again.")
     
     def process_voice_input(self):
         """Process voice input through the agent pipeline"""
         text = self.listen_for_speech()
         if not text:
             return
+        
+        # Check if we're waiting for booking confirmation
+        if self.awaiting_booking_confirmation:
+            response = self.check_yes_no_response(text)
+            
+            if response == 'yes':
+                self.log_message(f"User confirmed booking {self.recommended_platform}")
+                self.awaiting_booking_confirmation = False
+                self.book_cab(self.recommended_platform)
+                return
+            elif response == 'no':
+                self.log_message("User declined booking, asking for new locations")
+                self.awaiting_booking_confirmation = False
+                self.reset_for_new_search()
+                return
+            else:
+                self.log_message("Could not understand response. Please say 'yes' to book or 'no' to search again.")
+                self.speak("I didn't understand. Please say 'yes' to book or 'no' to search for new locations.")
+                return
         
         # Extract locations using LLM or fallback
         locations = self.extract_locations_with_llm(text)
@@ -616,16 +783,19 @@ class VoiceCabApp:
         comparison = self.compare_prices(prices)
         self.log_message(f"Price Comparison: {comparison}")
         
-        # Speak the results
-        speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees."
+        # Determine recommended platform and set up for booking confirmation
         if ola_price < uber_price:
-            speech_text += f" Ola is cheaper by {round(uber_price - ola_price)} rupees. Would you like to book Ola?"
+            self.recommended_platform = 'ola'
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Ola is cheaper by {round(uber_price - ola_price)} rupees. Would you like to book Ola?"
         elif uber_price < ola_price:
-            speech_text += f" Uber is cheaper by {round(ola_price - uber_price)} rupees. Would you like to book Uber?"
+            self.recommended_platform = 'uber'
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Uber is cheaper by {round(ola_price - uber_price)} rupees. Would you like to book Uber?"
         else:
-            speech_text += " Both platforms have the same price."
+            self.recommended_platform = 'uber'  # Default to uber if same price
+            speech_text = f"Price on Ola is {round(ola_price)} rupees, price on Uber is {round(uber_price)} rupees. Both platforms have the same price. Would you like to book Uber?"
         
         self.speak(speech_text)
+        self.awaiting_booking_confirmation = True
         
         # Enable booking buttons
         self.book_uber_button.config(state='normal')
@@ -703,9 +873,8 @@ def main():
     app.log_message("Welcome to Voice-Enabled Cab Price Comparison!")
     app.log_message("You can use voice input or manual input to compare prices.")
     app.log_message("For voice input, click 'Start Voice Input' and say something like:")
-    app.log_message("- 'Book a cab from airport to mall'")
-    app.log_message("- 'I want to go from home to office'")
-    app.log_message("- 'Pick me up at station and drop me at hospital'")
+    app.log_message("- 'Book a cab from BMS College to BTM Layout'")
+    app.log_message("- 'I want to go from Jayanagara 4th Block to Commercial Street, Bangalore'")
     app.log_message("")
     app.log_message("For manual input, simply fill in the pickup and dropoff locations.")
     app.log_message("")
