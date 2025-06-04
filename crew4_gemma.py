@@ -14,9 +14,10 @@ from typing import Dict, List, Optional
 import json
 import re
 import os
+import requests
 
 class MockCabAPI:
-    """Mock API for simulating Uber and Ola cab services"""
+    """Mock API for simulating Uber and Ola cab services with real-time distance calculation"""
     
     def __init__(self):
         self.base_prices = {
@@ -24,19 +25,130 @@ class MockCabAPI:
             'ola': {'base': 45, 'per_km': 10, 'surge_multiplier': 1.0}
         }
         self.bookings = []
+        
+        # OpenStreetMap services
+        self.nominatim_url = "https://nominatim.openstreetmap.org/search"
+        self.osrm_url = "http://router.project-osrm.org/route/v1/driving"
+        
+        # Cache for geocoded locations to avoid repeated API calls
+        self.location_cache = {}
+    
+    def geocode_location(self, location: str) -> Dict:
+        """Convert location string to latitude and longitude using Nominatim (OpenStreetMap)"""
+        if location in self.location_cache:
+            return self.location_cache[location]
+        
+        try:
+            params = {
+                'q': location,
+                'format': 'json',
+                'limit': 1,
+                'addressdetails': 1
+            }
+            
+            headers = {
+                'User-Agent': 'MockCabAPI/1.0 (your-email@example.com)'  # Required by Nominatim
+            }
+            
+            response = requests.get(self.nominatim_url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data:
+                result = {
+                    'lat': float(data[0]['lat']),
+                    'lon': float(data[0]['lon']),
+                    'display_name': data[0]['display_name']
+                }
+                self.location_cache[location] = result
+                return result
+            else:
+                # Return None if location not found
+                return None
+                
+        except Exception as e:
+            print(f"Geocoding failed for {location}: {e}")
+            return None
+
+    
+    def calculate_distance_osrm(self, pickup_coords: Dict, dropoff_coords: Dict) -> float:
+        """Calculate distance using OSRM (Open Source Routing Machine) - OpenStreetMap based"""
+        try:
+            # Format coordinates for OSRM API
+            pickup_coord = f"{pickup_coords['lon']},{pickup_coords['lat']}"
+            dropoff_coord = f"{dropoff_coords['lon']},{dropoff_coords['lat']}"
+            
+            url = f"{self.osrm_url}/{pickup_coord};{dropoff_coord}"
+            params = {
+                'overview': 'false',  # We don't need the route geometry
+                'steps': 'false'      # We don't need turn-by-turn directions
+            }
+            
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data.get('code') == 'Ok' and 'routes' in data and data['routes']:
+                # Distance is returned in meters, convert to kilometers
+                distance_km = data['routes'][0]['distance'] / 1000
+                return round(distance_km, 2)
+            else:
+                raise Exception(f"OSRM API error: {data.get('message', 'No route found')}")
+                
+        except Exception as e:
+            print(f"OSRM API failed: {e}")
+            return self._calculate_haversine_distance(pickup_coords, dropoff_coords)
+    
+    def _calculate_haversine_distance(self, coord1: Dict, coord2: Dict) -> float:
+        """Fallback distance calculation using Haversine formula"""
+        import math
+        
+        lat1, lon1 = math.radians(coord1['lat']), math.radians(coord1['lon'])
+        lat2, lon2 = math.radians(coord2['lat']), math.radians(coord2['lon'])
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        
+        # Earth's radius in kilometers
+        r = 6371
+        distance = r * c
+        
+        # Add some randomness to simulate real road distances vs straight-line distance
+        road_factor = random.uniform(1.2, 1.5)  # Roads are typically 20-50% longer than straight line
+        
+        return round(distance * road_factor, 2)
     
     def calculate_distance(self, pickup: str, dropoff: str) -> float:
-        """Simulate distance calculation between locations"""
-        # Mock distance calculation based on location names
-        locations = ['airport', 'mall', 'station', 'hospital', 'office', 'home']
-        pickup_clean = pickup.lower().strip()
-        dropoff_clean = dropoff.lower().strip()
-        
-        # Simple mock distance based on string similarity
-        base_distance = random.uniform(5, 25)
-        if any(loc in pickup_clean for loc in locations) and any(loc in dropoff_clean for loc in locations):
-            return round(base_distance, 2)
-        return round(base_distance + random.uniform(0, 10), 2)
+        """Calculate real distance between locations using OpenStreetMap services"""
+        try:
+            # Add small delay to respect API rate limits
+            time.sleep(0.1)
+            
+            # Geocode both locations
+            pickup_coords = self.geocode_location(pickup)
+            dropoff_coords = self.geocode_location(dropoff)
+            
+            # Check if geocoding was successful
+            if not pickup_coords:
+                raise Exception(f"Could not find location: {pickup}")
+            if not dropoff_coords:
+                raise Exception(f"Could not find location: {dropoff}")
+            
+            print(f"Pickup: {pickup} -> {pickup_coords['display_name']}")
+            print(f"Dropoff: {dropoff} -> {dropoff_coords['display_name']}")
+            
+            # Calculate distance using OSRM (falls back to Haversine if API fails)
+            distance = self.calculate_distance_osrm(pickup_coords, dropoff_coords)
+            
+            return distance
+            
+        except Exception as e:
+            print(f"Distance calculation failed: {e}")
+            # Ultimate fallback to haversine calculation with random coordinates
+            return round(random.uniform(5, 30), 2)
     
     def get_price(self, platform: str, pickup: str, dropoff: str) -> Dict:
         """Get price estimate for a platform"""
@@ -75,7 +187,7 @@ class MockCabAPI:
         }
         self.bookings.append(booking)
         return booking
-
+    
 # Global instance of MockCabAPI to share across tools
 mock_cab_api = MockCabAPI()
 
